@@ -1,0 +1,15 @@
+#compdef oc
+
+local -a profiles
+local dir
+for dir in "${HOME}/.config/opencode/profiles"/*/; do
+    [[ -f "${dir}opencode.jsonc" ]] && profiles+=("${dir:t}")
+done
+
+_arguments -C \
+    '(-p --profile)'{-p,--profile}'[Opencode profile]:profile:compadd -a profiles' \
+    '*:: :->args'
+
+if [[ $state == args ]]; then
+    _opencode
+fi
