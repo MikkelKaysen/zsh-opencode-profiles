@@ -22,6 +22,13 @@ oc --copy personal work -f # overwrite existing dest
 oc -c personal work --force
 ```
 
+Delete a profile:
+
+```sh
+oc --delete work     # delete the work profile
+oc -d work           # short form
+```
+
 ## Profiles
 
 Profiles are discovered dynamically from `~/.config/opencode/profiles/*/opencode.jsonc`.

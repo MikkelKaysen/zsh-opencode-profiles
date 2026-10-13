@@ -10,6 +10,7 @@ _arguments -C \
     '(-p --profile)'{-p,--profile}'[Opencode profile]:profile:compadd -a profiles' \
     '(-c --copy)'{-c,--copy}'[Copy a profile to a new profile]' \
     '(-f --force)'{-f,--force}'[Overwrite existing destination profile]' \
+    '(-d --delete)'{-d,--delete}'[Delete a profile]' \
     '*:: :->args'
 
 if [[ $state == args ]]; then
@@ -18,6 +19,8 @@ if [[ $state == args ]]; then
             1) compadd -a profiles ;;
             2) _message "Destination profile name" ;;
         esac
+    elif [[ -n ${opt_args[(I)-d]} || -n ${opt_args[(I)--delete]} ]]; then
+        compadd -a profiles
     else
         _opencode
     fi

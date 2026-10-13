@@ -13,6 +13,7 @@ oc() {
     local profile="personal"
     local do_copy=0
     local do_force=0
+    local do_delete=0
     local -a positionals
 
     while [[ $# -gt 0 ]]; do
@@ -27,6 +28,10 @@ oc() {
                 ;;
             -f|--force)
                 do_force=1
+                shift
+                ;;
+            -d|--delete)
+                do_delete=1
                 shift
                 ;;
             --)
@@ -62,6 +67,22 @@ oc() {
         rm -rf "$dest_dir"
         cp -r "$source_dir" "$dest_dir"
         print "Copied profile '${source_profile}' to '${dest_profile}'"
+        return 0
+    fi
+
+    if (( do_delete )); then
+        if [[ ${#positionals[@]} -lt 1 ]]; then
+            print -u2 "Usage: oc --delete <profile>"
+            return 1
+        fi
+        local delete_profile="${positionals[1]}"
+        local delete_dir="${profiles_dir}/${delete_profile}"
+        if [[ ! -d "$delete_dir" ]]; then
+            print -u2 "Profile '${delete_profile}' not found"
+            return 1
+        fi
+        rm -rf "$delete_dir"
+        print "Deleted profile '${delete_profile}'"
         return 0
     fi
 
