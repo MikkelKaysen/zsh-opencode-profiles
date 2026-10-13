@@ -11,6 +11,9 @@ if [[ ${zsh_loaded_plugins[-1]} != */zsh-opencode-profiles && -z ${fpath[(r)${0:
 }
 oc() {
     local profile="personal"
+    local do_copy=0
+    local do_force=0
+    local -a positionals
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -18,27 +21,61 @@ oc() {
                 profile="$2"
                 shift 2
                 ;;
+            -c|--copy)
+                do_copy=1
+                shift
+                ;;
+            -f|--force)
+                do_force=1
+                shift
+                ;;
             --)
                 shift
+                positionals+=("$@")
                 break
                 ;;
             *)
-                break
+                positionals+=("$1")
+                shift
                 ;;
         esac
-    done
+    done 
 
-    local config_file="${HOME}/.config/opencode/profiles/${profile}/opencode.jsonc"
+    local profiles_dir="${HOME}/.config/opencode/profiles"
+
+    if (( do_copy )); then
+        if [[ ${#positionals[@]} -lt 2 ]]; then
+            print -u2 "Usage: oc --copy <source> <dest> [--force]"
+            return 1
+        fi
+        local source_profile="${positionals[1]}" dest_profile="${positionals[2]}"
+        local source_dir="${profiles_dir}/${source_profile}"
+        local dest_dir="${profiles_dir}/${dest_profile}"
+        if [[ ! -d "$source_dir" ]]; then
+            print -u2 "Source profile '${source_profile}' not found"
+            return 1
+        fi
+        if [[ -d "$dest_dir" ]] && (( ! do_force )); then
+            print -u2 "Destination profile '${dest_profile}' already exists. Use --force to overwrite."
+            return 1
+        fi
+        rm -rf "$dest_dir"
+        cp -r "$source_dir" "$dest_dir"
+        print "Copied profile '${source_profile}' to '${dest_profile}'"
+        return 0
+    fi
+
+    local config_file="${profiles_dir}/${profile}/opencode.jsonc"
 
     if [[ ! -f "$config_file" ]]; then
         print -u2 "Profile '${profile}' not found at ${config_file}"
         print -u2 "Available profiles:"
         local dir
-        for dir in "${HOME}/.config/opencode/profiles"/*/; do
+        for dir in "${profiles_dir}"/*/; do
             [[ -f "${dir}opencode.jsonc" ]] && print -u2 "  ${dir:t}"
         done
         return 1
     fi
 
-    OPENCODE_CONFIG="$config_file" opencode "$@"
+    OPENCODE_CONFIG="$config_file" opencode "${positionals[@]}"
 }

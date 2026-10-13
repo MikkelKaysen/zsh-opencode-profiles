@@ -8,8 +8,17 @@ done
 
 _arguments -C \
     '(-p --profile)'{-p,--profile}'[Opencode profile]:profile:compadd -a profiles' \
+    '(-c --copy)'{-c,--copy}'[Copy a profile to a new profile]' \
+    '(-f --force)'{-f,--force}'[Overwrite existing destination profile]' \
     '*:: :->args'
 
 if [[ $state == args ]]; then
-    _opencode
+    if [[ -n ${opt_args[(I)-c]} || -n ${opt_args[(I)--copy]} ]]; then
+        case $CURRENT in
+            1) compadd -a profiles ;;
+            2) _message "Destination profile name" ;;
+        esac
+    else
+        _opencode
+    fi
 fi

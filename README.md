@@ -11,6 +11,17 @@ oc -p work              # launch opencode with the work profile
 oc --profile personal   # long form
 ```
 
+## Profile Management
+
+Copy an existing profile to a new one:
+
+```sh
+oc --copy personal work     # copy personal → work
+oc -c personal work         # short form
+oc --copy personal work -f # overwrite existing dest
+oc -c personal work --force
+```
+
 ## Profiles
 
 Profiles are discovered dynamically from `~/.config/opencode/profiles/*/opencode.jsonc`.
