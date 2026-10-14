@@ -10,6 +10,10 @@ if [[ ${zsh_loaded_plugins[-1]} != */zsh-opencode-profiles && -z ${fpath[(r)${0:
     fpath+=( "${0:h}/functions" )
 }
 
+# Standard hash for plugins, to not pollute the namespace
+typeset -gA Plugins
+Plugins[ZSH_OPENCODE_PROFILES_DIR]="${0:h}"
+
 _oc_opencode_major_version() {
     # v2 prints "opencode v2.0.28", v1 prints e.g. "1.18.31".
     opencode --version 2>&1 | grep -oE '[0-9]+' | head -n 1
@@ -137,3 +141,36 @@ oc() {
         OPENCODE_CONFIG="$config_file" opencode "${positionals[@]}"
     fi
 }
+
+# Generate opencode completion function.  Regenerate when opencode is newer.
+# v2 produces clean static completions via --completions zsh; v1 uses the
+# yargs completion command and needs post-processing to rename the function,
+# add a $0: reply filter, and fix a broken autoload check.
+(( ${+commands[opencode]} )) && () {
+    local command=${commands[opencode]}
+    [[ -z $command ]] && return 1
+
+    local cachedir=$1
+    local compfile=$cachedir/functions/_opencode
+    [[ -d ${compfile:h} ]] || mkdir -p ${compfile:h}
+
+    if [[ ! -e $compfile || $compfile -ot $command ]]; then
+        local major
+        major=$(_oc_opencode_major_version)
+        if (( ${major:-0} >= 2 )); then
+            opencode --completions zsh >| $compfile 2>/dev/null
+        else
+            opencode completion 2>/dev/null | \
+                sed -e 's/_opencode_yargs_completions/_opencode/g' \
+                    -e '/IFS=\$si/a\  reply=(${reply:#\\$0:*})' \
+                    -e "s/\"'/\"/g" >| $compfile
+        fi
+
+        # If generation failed, remove the stale/empty file and skip.
+        if [[ ! -s $compfile ]]; then
+            rm -f $compfile
+            return 1
+        fi
+        print -u2 -PR "* Detected a new version of 'opencode'. Regenerated completions."
+    fi
+} ${Plugins[ZSH_OPENCODE_PROFILES_DIR]}

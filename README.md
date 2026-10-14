@@ -42,6 +42,15 @@ Then run:
 zimfw install
 ```
 
+## Features
+
+When `opencode` is found on the system, the plugin:
+
+1. Generates the opencode completion function (`_opencode`) and regenerates it when the `opencode` binary is newer.
+2. Supports both opencode v1 and v2:
+   - **v2**: Uses `opencode --completions zsh` (static completion script, works out of the box).
+   - **v1**: Uses `opencode completion` (dynamic yargs completions, post-processed to rename the function to `_opencode`, add a `$0:` reply filter, and repair a broken autoload check).
+
 ## Usage
 
 ```sh
