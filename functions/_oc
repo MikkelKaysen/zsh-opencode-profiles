@@ -22,6 +22,9 @@ if [[ $state == args ]]; then
     elif [[ -n ${opt_args[(I)-d]} || -n ${opt_args[(I)--delete]} ]]; then
         compadd -a profiles
     else
+        words=(opencode "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%%:*}:opencode:"
         _opencode
     fi
 fi
