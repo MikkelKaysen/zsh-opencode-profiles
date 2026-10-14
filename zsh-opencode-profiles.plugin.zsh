@@ -9,6 +9,36 @@
 if [[ ${zsh_loaded_plugins[-1]} != */zsh-opencode-profiles && -z ${fpath[(r)${0:h}/functions]} ]] {
     fpath+=( "${0:h}/functions" )
 }
+
+_oc_opencode_major_version() {
+    # v2 prints "opencode v2.0.28", v1 prints e.g. "1.18.31".
+    opencode --version 2>&1 | grep -oE '[0-9]+' | head -n 1
+}
+
+# v2 uses a shared background service that reads configuration at startup and
+# keeps it for its lifetime. Attach to a running service that already has this
+# profile's config; otherwise stop the stale service and start one with it.
+_oc_v2_launch() {
+    local config_file="$1" profile="$2"
+    shift 2
+    local -a args=("$@")
+
+    local service_url
+    service_url=$(opencode service status 2>/dev/null)
+
+    if [[ "$service_url" == http* ]]; then
+        local server_config
+        server_config=$(opencode debug config 2>/dev/null)
+        if [[ "$server_config" == *"profiles/${profile}/opencode.jsonc"* ]]; then
+            opencode "${args[@]}"
+            return $?
+        fi
+        opencode service stop 2>/dev/null
+    fi
+
+    OPENCODE_CONFIG="$config_file" opencode "${args[@]}"
+}
+
 oc() {
     local profile="personal"
     local do_copy=0
@@ -98,5 +128,12 @@ oc() {
         return 1
     fi
 
-    OPENCODE_CONFIG="$config_file" opencode "${positionals[@]}"
+    # v2 detects its own background service; v1 just honors OPENCODE_CONFIG.
+    local major
+    major=$(_oc_opencode_major_version)
+    if (( ${major:-0} >= 2 )); then
+        _oc_v2_launch "$config_file" "$profile" "${positionals[@]}"
+    else
+        OPENCODE_CONFIG="$config_file" opencode "${positionals[@]}"
+    fi
 }
