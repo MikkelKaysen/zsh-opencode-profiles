@@ -229,9 +229,11 @@ _oc_v2_launch() (
         fi
         if (( want_stop || want_restart )); then
             _oc_v2_stop_owned "$state_dir" "$pid" "$port" "$password" "$config_fragment" "$start" || return 1
+            if (( want_stop )); then
+                return 0
+            fi
         else
             zsystem flock -u "$lock_fd" 2>/dev/null
-            exec {lock_fd}>&-
             url="http://127.0.0.1:${port}"
             OPENCODE_CONFIG="$config_file" OPENCODE_PASSWORD="$password" opencode --server "$url" "${args[@]}"
             return $?
@@ -322,7 +324,6 @@ _oc_v2_launch() (
                 if _oc_v2_api_matches "$pid" "$port" "$password" "$config_fragment" "$expected_start" "$serve_log"; then
                     url="http://127.0.0.1:${port}"
                     zsystem flock -u "$lock_fd" 2>/dev/null
-                    exec {lock_fd}>&-
                     OPENCODE_CONFIG="$config_file" OPENCODE_PASSWORD="$password" opencode --server "$url" "${args[@]}"
                     return $?
                 fi
