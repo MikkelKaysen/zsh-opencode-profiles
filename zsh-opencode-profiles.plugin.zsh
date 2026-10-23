@@ -32,7 +32,7 @@ _oc_v2_state_dir() {
 _oc_v2_atomic_write() {
     local file="$1" value="$2" tmp="${1}.tmp.$$.$RANDOM"
     ( umask 077; print -rn -- "$value" >| "$tmp" ) || return 1
-    chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    command chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     mv -f -- "$tmp" "$file"
 }
 
@@ -156,7 +156,7 @@ _oc_v2_launch() (
         ( umask 077; mkdir -p -- "$state_dir" ) || { print -u2 "Cannot create metadata directory ${state_dir}"; return 1; }
     fi
     [[ ! -L "$state_dir" ]] || { print -u2 "Refusing symlink metadata directory ${state_dir}"; return 1; }
-    chmod 700 "$state_dir" 2>/dev/null || { print -u2 "Cannot protect metadata directory ${state_dir}"; return 1; }
+    command chmod 700 "$state_dir" 2>/dev/null || { print -u2 "Cannot protect metadata directory ${state_dir}"; return 1; }
     if (( want_stop )) && [[ ! -e "$pid_file" && ! -e "$port_file" && ! -e "$password_file" ]]; then
         print "No running opencode server for profile '${profile}'"
         return 0
@@ -171,7 +171,7 @@ _oc_v2_launch() (
     if [[ ! -e "$lock_file" ]]; then
         ( umask 077; : >| "$lock_file" ) || { print -u2 "Cannot create profile lock file."; return 1; }
     fi
-    chmod 600 "$lock_file" 2>/dev/null || { print -u2 "Cannot protect profile lock file."; return 1; }
+    command chmod 600 "$lock_file" 2>/dev/null || { print -u2 "Cannot protect profile lock file."; return 1; }
     zmodload zsh/system 2>/dev/null || { print -u2 "This zsh installation lacks zsystem flock support."; return 1; }
     if ! zsystem flock -t 5 -f lock_fd "$lock_file"; then
         print -u2 "Another oc operation is managing profile '${profile}'. Retry shortly."
@@ -186,11 +186,11 @@ _oc_v2_launch() (
         print -u2 "Refusing symlink start-identity metadata for profile '${profile}'"
         return 1
     fi
-    [[ ! -f "$password_file" ]] || chmod 600 "$password_file" 2>/dev/null || {
+    [[ ! -f "$password_file" ]] || command chmod 600 "$password_file" 2>/dev/null || {
         print -u2 "Cannot protect profile password metadata for '${profile}'"
         return 1
     }
-    [[ ! -f "$start_file" ]] || chmod 600 "$start_file" 2>/dev/null || {
+    [[ ! -f "$start_file" ]] || command chmod 600 "$start_file" 2>/dev/null || {
         print -u2 "Cannot protect profile start-identity metadata for '${profile}'"
         return 1
     }
@@ -265,7 +265,7 @@ _oc_v2_launch() (
         return 1
     }
     ( umask 077; command touch "$serve_log" ) || { print -u2 "Cannot create server log in ${state_dir}"; return 1; }
-    chmod 600 "$serve_log" 2>/dev/null || return 1
+    command chmod 600 "$serve_log" 2>/dev/null || return 1
     _oc_v2_atomic_write "$password_file" "$password" || { print -u2 "Cannot securely write profile password metadata."; return 1; }
 
     if [[ -f "$port_file" ]]; then
