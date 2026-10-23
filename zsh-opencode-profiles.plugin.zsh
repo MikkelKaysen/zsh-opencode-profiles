@@ -121,6 +121,37 @@ _oc_v2_stop_spawned() {
     ! _oc_v2_pid_alive "$pid"
 }
 
+_oc_v2_client() {
+    local config_file="$1" password="$2" url="$3"
+    shift 3
+    local -a args=("$@")
+
+    local -a known_cmds=(
+        upgrade update uninstall acp api debug auth mcp plugin models
+        stats mini run session service reload pair serve
+    )
+
+    local -i has_args=${#args[@]}
+    local first="${args[1]:-}"
+
+    # No forwarded args, or first arg is not a known subcommand → TUI (directory arg).
+    if (( ! has_args )) || [[ ! " ${(j: :)known_cmds[@]} " == *" $first "* ]]; then
+        OPENCODE_CONFIG="$config_file" OPENCODE_PASSWORD="$password" opencode --server "$url" "${args[@]}"
+        return $?
+    fi
+
+    # First arg is 'run' or 'api' → routed to the profile server with --server after the subcommand.
+    if [[ "$first" == "run" || "$first" == "api" ]]; then
+        OPENCODE_CONFIG="$config_file" OPENCODE_PASSWORD="$password" \
+            opencode "$first" --server "$url" "${args[@]:1}"
+        return $?
+    fi
+
+    # Other known subcommand → local, config-based; no --server, no password.
+    OPENCODE_CONFIG="$config_file" opencode "${args[@]}"
+    return $?
+}
+
 _oc_v2_launch() (
     local config_file="$1" profile="$2"
     local -i want_restart="${3:-0}"
@@ -134,6 +165,10 @@ _oc_v2_launch() (
         case "$arg" in
             --server|--server=*)
                 print -u2 "oc controls the OpenCode --server URL for profile servers; remove the forwarded --server option."
+                return 1
+                ;;
+            --standalone)
+                print -u2 "oc manages the profile server; remove the forwarded --standalone option."
                 return 1
                 ;;
         esac
@@ -235,7 +270,7 @@ _oc_v2_launch() (
         else
             zsystem flock -u "$lock_fd" 2>/dev/null
             url="http://127.0.0.1:${port}"
-            OPENCODE_CONFIG="$config_file" OPENCODE_PASSWORD="$password" opencode --server "$url" "${args[@]}"
+            _oc_v2_client "$config_file" "$password" "$url" "${args[@]}"
             return $?
         fi
     elif (( metadata_complete )) && _oc_v2_pid_alive "$pid"; then
@@ -324,7 +359,7 @@ _oc_v2_launch() (
                 if _oc_v2_api_matches "$pid" "$port" "$password" "$config_fragment" "$expected_start" "$serve_log"; then
                     url="http://127.0.0.1:${port}"
                     zsystem flock -u "$lock_fd" 2>/dev/null
-                    OPENCODE_CONFIG="$config_file" OPENCODE_PASSWORD="$password" opencode --server "$url" "${args[@]}"
+                    _oc_v2_client "$config_file" "$password" "$url" "${args[@]}"
                     return $?
                 fi
             fi

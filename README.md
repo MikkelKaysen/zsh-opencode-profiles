@@ -90,14 +90,20 @@ The wrapper attaches through OpenCode's native `--server` option, so different
 profiles can run concurrently without using OpenCode's global service
 registration:
 
-`oc` controls `--server` for the managed profile URL; forwarding another
-`--server` option is rejected.
+`oc` routes forwarded opencode subcommands through a helper: the TUI (and any
+unknown first argument, e.g. a target directory) attaches via `--server`;
+`run` and `api` are routed to the profile server with `--server` placed after
+the subcommand; all other known subcommands (e.g. `plugin check`, `debug
+config`) run locally against the profile's config without `--server` or a
+password. Forwarded `--server` and `--standalone` options are always rejected.
 
 ```sh
-oc -p work          # start (or attach to) the work profile's server
-oc -p minds         # start (or attach to) the minds server too — both run
+oc -p work          # TUI — attaches via --server to the profile server
+oc -p minds         # TUI — attaches to the minds server too — both run
 oc -p work --restart # stop the verified work server, start a fresh one
 oc -p work --stop    # stop the verified work server and exit
+oc -p minds plugin check   # local subcommand, runs against the minds config
+oc -p work run "hello"     # routed to the work profile's server
 ```
 
 - Wrapper-only metadata and logs are stored under
