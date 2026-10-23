@@ -58,6 +58,8 @@ oc                      # launch opencode with the default profile (personal)
 oc -p minds             # launch opencode with the minds profile
 oc -p work              # launch opencode with the work profile
 oc --profile personal   # long form
+oc -p work --restart    # stop + restart the work profile's server, then attach
+oc -p work --stop       # stop the work profile's server and exit
 ```
 
 ### Profile Management
@@ -77,6 +79,36 @@ Delete a profile:
 oc --delete work     # delete the work profile
 oc -d work           # short form
 ```
+
+### Background Servers (v2)
+
+With opencode v2, each profile runs its **own background server** on its own
+ephemeral port, isolated via a per-profile state directory
+(`~/.local/state/oc/<profile>/`). Different profiles can therefore run at the
+same time without one displacing another:
+
+```sh
+oc -p work          # start (or attach to) the work profile's server
+oc -p minds         # start (or attach to) the minds server too — both run
+```
+
+- Sessions and credentials stay shared (opencode's data directory is not
+  partitioned per profile).
+- `oc` never stops a server belonging to another profile. To replace the server
+  for the profile you are launching, use `--restart`; to stop it without
+  relaunching, use `--stop`:
+
+```sh
+oc -p work --restart   # stop the work server, start a fresh one, attach
+oc -p work -s          # stop the work server and exit
+```
+
+If a profile's registered server is running a different config than expected,
+`oc` refuses to attach (it will not silently kill it) and suggests `--restart`.
+
+> **Note:** A background server that predates this behaviour (the single global
+> service on the default port 49374) is left untouched. Plain `opencode` still
+> talks to it. `oc`-launched servers use the per-profile layout above.
 
 ### Profiles
 

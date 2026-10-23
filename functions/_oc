@@ -11,6 +11,8 @@ _arguments -C \
     '(-c --copy)'{-c,--copy}'[Copy a profile to a new profile]' \
     '(-f --force)'{-f,--force}'[Overwrite existing destination profile]' \
     '(-d --delete)'{-d,--delete}'[Delete a profile]' \
+    '(-r --restart)'{-r,--restart}'[Restart the background server for this profile]' \
+    '(-s --stop)'{-s,--stop}'[Stop the background server for this profile]' \
     '*:: :->args'
 
 if [[ $state == args ]]; then

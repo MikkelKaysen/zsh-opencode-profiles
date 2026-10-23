@@ -19,28 +19,82 @@ _oc_opencode_major_version() {
     opencode --version 2>&1 | grep -oE '[0-9]+' | head -n 1
 }
 
-# v2 uses a shared background service that reads configuration at startup and
-# keeps it for its lifetime. Attach to a running service that already has this
-# profile's config; otherwise stop the stale service and start one with it.
+# v2 keeps one background service per state directory, pinned to a single
+# fixed port. To let several profiles run at the same time, each profile gets
+# its own state directory via XDG_STATE_HOME; that isolates its service
+# registration and PTY daemon, so one profile's server never blocks another's.
+# The service is started with `--port 0` so the OS picks a free port (no
+# bookkeeping, no collisions). The shared data directory (db, auth, storage) is
+# kept in place so sessions and credentials stay shared across profiles.
+_oc_v2_state_dir() {
+    print -r -- "${HOME}/.local/state/oc/${1}"
+}
+
 _oc_v2_launch() {
     local config_file="$1" profile="$2"
-    shift 2
+    local -i want_restart="${3:-0}"
+    local -i want_stop="${4:-0}"
+    shift 4
     local -a args=("$@")
 
-    local service_url
-    service_url=$(opencode service status 2>/dev/null)
+    local state_dir
+    state_dir=$(_oc_v2_state_dir "$profile")
 
-    if [[ "$service_url" == http* ]]; then
-        local server_config
-        server_config=$(opencode debug config 2>/dev/null)
-        if [[ "$server_config" == *"profiles/${profile}/opencode.jsonc"* ]]; then
-            opencode "${args[@]}"
-            return $?
+    # --stop: tear this profile's server down and exit.
+    if (( want_stop )); then
+        if [[ $(XDG_STATE_HOME="$state_dir" opencode service status 2>/dev/null) == http* ]]; then
+            XDG_STATE_HOME="$state_dir" opencode service stop 2>/dev/null
+            print "Stopped opencode service for profile '${profile}'"
+        else
+            print "No running opencode service for profile '${profile}'"
         fi
-        opencode service stop 2>/dev/null
+        return 0
     fi
 
-    OPENCODE_CONFIG="$config_file" opencode "${args[@]}"
+    # --restart: replace this profile's server before (re)launching.
+    if (( want_restart )); then
+        XDG_STATE_HOME="$state_dir" opencode service stop 2>/dev/null
+    fi
+
+    local service_url
+    service_url=$(XDG_STATE_HOME="$state_dir" opencode service status 2>/dev/null)
+
+    # Attach if a service for this profile is already running with the right
+    # config. Refuse (rather than kill) if the registered service is running a
+    # different config — the user must opt in with --restart.
+    if [[ "$service_url" == http* ]]; then
+        local server_config
+        server_config=$(XDG_STATE_HOME="$state_dir" opencode debug config 2>/dev/null)
+        if [[ "$server_config" == *"profiles/${profile}/opencode.jsonc"* ]]; then
+            XDG_STATE_HOME="$state_dir" opencode "${args[@]}"
+            return $?
+        fi
+        print -u2 "Profile '${profile}' has a running service with a different config."
+        print -u2 "Use 'oc -p ${profile} --restart' to replace it."
+        return 1
+    fi
+
+    # No service for this profile: start a fresh one without touching any other
+    # profile, then attach.
+    mkdir -p "$state_dir"
+    command nohup env XDG_STATE_HOME="$state_dir" OPENCODE_CONFIG="$config_file" \
+        opencode serve --service --port 0 >> "${state_dir}/serve.log" 2>&1 &!
+
+    local -i attempt
+    for (( attempt = 0; attempt < 30; attempt++ )); do
+        service_url=$(XDG_STATE_HOME="$state_dir" opencode service status 2>/dev/null)
+        [[ "$service_url" == http* ]] && break
+        sleep 0.5
+    done
+
+    if [[ "$service_url" != http* ]]; then
+        print -u2 "Timed out waiting for the '${profile}' service to start."
+        print -u2 "Last lines of ${state_dir}/serve.log:"
+        tail -n 20 "${state_dir}/serve.log" 2>/dev/null | sed 's/^/  /'
+        return 1
+    fi
+
+    XDG_STATE_HOME="$state_dir" OPENCODE_CONFIG="$config_file" opencode "${args[@]}"
 }
 
 oc() {
@@ -48,6 +102,8 @@ oc() {
     local do_copy=0
     local do_force=0
     local do_delete=0
+    local do_restart=0
+    local do_stop=0
     local -a positionals
 
     while [[ $# -gt 0 ]]; do
@@ -66,6 +122,14 @@ oc() {
                 ;;
             -d|--delete)
                 do_delete=1
+                shift
+                ;;
+            -r|--restart)
+                do_restart=1
+                shift
+                ;;
+            -s|--stop)
+                do_stop=1
                 shift
                 ;;
             --)
@@ -136,7 +200,7 @@ oc() {
     local major
     major=$(_oc_opencode_major_version)
     if (( ${major:-0} >= 2 )); then
-        _oc_v2_launch "$config_file" "$profile" "${positionals[@]}"
+        _oc_v2_launch "$config_file" "$profile" "$do_restart" "$do_stop" "${positionals[@]}"
     else
         OPENCODE_CONFIG="$config_file" opencode "${positionals[@]}"
     fi
