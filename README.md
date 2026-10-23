@@ -94,6 +94,9 @@ oc -p minds         # start (or attach to) the minds server too — both run
 
 - Sessions and credentials stay shared (opencode's data directory is not
   partitioned per profile).
+- Only opencode's own state is profile-scoped. `mise` (which opencode may
+  invoke) is pinned to your normal state location via `MISE_STATE_DIR`, so it
+  isn't duplicated into each profile's state dir.
 - `oc` never stops a server belonging to another profile. To replace the server
   for the profile you are launching, use `--restart`; to stop it without
   relaunching, use `--stop`:

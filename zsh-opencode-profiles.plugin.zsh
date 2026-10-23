@@ -40,6 +40,10 @@ _oc_v2_launch() {
     local state_dir
     state_dir=$(_oc_v2_state_dir "$profile")
 
+    # opencode is a mise tool and may spawn mise. Keep mise's own state at the
+    # user's real location so that only opencode's state is profile-scoped.
+    local real_state="${XDG_STATE_HOME:-$HOME/.local/state}"
+
     # --stop: tear this profile's server down and exit.
     if (( want_stop )); then
         if [[ $(XDG_STATE_HOME="$state_dir" opencode service status 2>/dev/null) == http* ]]; then
@@ -66,7 +70,7 @@ _oc_v2_launch() {
         local server_config
         server_config=$(XDG_STATE_HOME="$state_dir" opencode debug config 2>/dev/null)
         if [[ "$server_config" == *"profiles/${profile}/opencode.jsonc"* ]]; then
-            XDG_STATE_HOME="$state_dir" opencode "${args[@]}"
+            XDG_STATE_HOME="$state_dir" MISE_STATE_DIR="$real_state/mise" opencode "${args[@]}"
             return $?
         fi
         print -u2 "Profile '${profile}' has a running service with a different config."
@@ -77,7 +81,8 @@ _oc_v2_launch() {
     # No service for this profile: start a fresh one without touching any other
     # profile, then attach.
     mkdir -p "$state_dir"
-    command nohup env XDG_STATE_HOME="$state_dir" OPENCODE_CONFIG="$config_file" \
+    command nohup env XDG_STATE_HOME="$state_dir" MISE_STATE_DIR="$real_state/mise" \
+        OPENCODE_CONFIG="$config_file" \
         opencode serve --service --port 0 >> "${state_dir}/serve.log" 2>&1 &!
 
     local -i attempt
@@ -94,7 +99,7 @@ _oc_v2_launch() {
         return 1
     fi
 
-    XDG_STATE_HOME="$state_dir" OPENCODE_CONFIG="$config_file" opencode "${args[@]}"
+    XDG_STATE_HOME="$state_dir" MISE_STATE_DIR="$real_state/mise" OPENCODE_CONFIG="$config_file" opencode "${args[@]}"
 }
 
 oc() {
