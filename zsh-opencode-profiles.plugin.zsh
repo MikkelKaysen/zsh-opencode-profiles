@@ -19,88 +19,359 @@ _oc_opencode_major_version() {
     opencode --version 2>&1 | grep -oE '[0-9]+' | head -n 1
 }
 
-# v2 keeps one background service per state directory, pinned to a single
-# fixed port. To let several profiles run at the same time, each profile gets
-# its own state directory via XDG_STATE_HOME; that isolates its service
-# registration and PTY daemon, so one profile's server never blocks another's.
-# The service is started with `--port 0` so the OS picks a free port (no
-# bookkeeping, no collisions). The shared data directory (db, auth, storage) is
-# kept in place so sessions and credentials stay shared across profiles.
-_oc_v2_state_dir() {
-    print -r -- "${HOME}/.local/state/oc/${1}"
+_oc_valid_profile() {
+    [[ -n "$1" && "$1" != . && "$1" != .. && "$1" =~ '^[A-Za-z0-9][A-Za-z0-9._-]*$' ]]
 }
 
-_oc_v2_launch() {
+# These files are wrapper metadata only. OpenCode and its children keep their
+# normal XDG/data directories so sessions and credentials remain shared.
+_oc_v2_state_dir() {
+    print -r -- "${XDG_STATE_HOME:-$HOME/.local/state}/oc/${1}"
+}
+
+_oc_v2_atomic_write() {
+    local file="$1" value="$2" tmp="${1}.tmp.$$.$RANDOM"
+    ( umask 077; print -rn -- "$value" >| "$tmp" ) || return 1
+    chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    mv -f -- "$tmp" "$file"
+}
+
+_oc_v2_pid_alive() {
+    local pid="$1" stat
+    [[ "$pid" == <-> ]] || return 1
+    stat=$(ps -p "$pid" -o stat= 2>/dev/null) || return 1
+    [[ -n "$stat" && "$stat" != *Z* ]]
+}
+
+_oc_v2_server_matches() {
+    local pid="$1" port="$2" expected_start="$3" uid="$(id -u)" ps_uid ps_args actual_start
+    [[ -n "$expected_start" ]] || return 1
+    _oc_v2_pid_alive "$pid" || return 1
+    ps_uid=$(ps -p "$pid" -o uid= 2>/dev/null) || return 1
+    ps_args=$(ps -p "$pid" -o args= 2>/dev/null) || return 1
+    actual_start=$(ps -p "$pid" -o lstart= 2>/dev/null) || return 1
+    ps_uid=${ps_uid//[[:space:]]/}
+    [[ "$ps_uid" == "$uid" && "$actual_start" == "$expected_start" &&
+       "$ps_args" =~ '(^|[[:space:]/])opencode(\.exe)?[[:space:]]+serve([[:space:]]|$)' &&
+       "$ps_args" == *"--hostname 127.0.0.1"* &&
+       "$ps_args" =~ "(^|[[:space:]])--port[[:space:]]+${port}([[:space:]]|$)" ]]
+}
+
+_oc_v2_log_bound() {
+    local port="$1" serve_log="$2"
+    grep -E -- "server listening on http://127\\.0\\.0\\.1:${port}([^0-9]|$)" "$serve_log" >/dev/null 2>&1
+}
+
+_oc_v2_bind_failed() {
+    local serve_log="$1"
+    grep -Eiq 'EADDRINUSE|address already in use' "$serve_log" 2>/dev/null
+}
+
+_oc_v2_api_matches() {
+    local pid="$1" port="$2" password="$3" config_fragment="$4" expected_start="$5" serve_log="$6"
+    local url="http://127.0.0.1:${port}" info info_pid server_config
+    _oc_v2_server_matches "$pid" "$port" "$expected_start" || return 1
+    _oc_v2_log_bound "$port" "$serve_log" || return 1
+    info=$(OPENCODE_PASSWORD="$password" opencode api --server "$url" get /api/info 2>/dev/null) || return 1
+    info_pid=$(print -r -- "$info" | tr '\n' ' ' | sed -n 's/^[[:space:]]*{[^{}]*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:],}].*/\1/p')
+    [[ "$info_pid" == <-> ]] || return 1
+    [[ "$info_pid" == "$pid" ]] || return 1
+    server_config=$(OPENCODE_PASSWORD="$password" opencode api --server "$url" get /api/config 2>/dev/null) || return 1
+    [[ "$server_config" == *"$config_fragment"* ]]
+}
+
+_oc_v2_stop_owned() {
+    local state_dir="$1" pid="$2" port="$3" password="$4" config_fragment="$5" expected_start="$6"
+    local serve_log="${state_dir}/serve.log"
+    if ! _oc_v2_server_matches "$pid" "$port" "$expected_start" ||
+       ! _oc_v2_api_matches "$pid" "$port" "$password" "$config_fragment" "$expected_start" "$serve_log"; then
+        print -u2 "Server ownership verification changed before stop; leaving PID ${pid} untouched."
+        return 1
+    fi
+    # Recheck the stored start identity and command immediately before signaling.
+    _oc_v2_server_matches "$pid" "$port" "$expected_start" || {
+        print -u2 "Server identity changed before stop; leaving PID ${pid} untouched."
+        return 1
+    }
+    kill -TERM "$pid" 2>/dev/null || return 1
+    local -i attempt
+    for (( attempt = 0; attempt < 40; attempt++ )); do
+        _oc_v2_pid_alive "$pid" || break
+        sleep 0.1
+    done
+    if _oc_v2_pid_alive "$pid"; then
+        print -u2 "Timed out waiting for the owned opencode server (PID ${pid}) to exit; it was not force-killed."
+        return 1
+    fi
+    rm -f -- "${state_dir}/pid" "${state_dir}/start"
+    print "Stopped opencode server (PID ${pid})"
+}
+
+_oc_v2_stop_spawned() {
+    local pid="$1" port="$2" expected_start="$3"
+    _oc_v2_server_matches "$pid" "$port" "$expected_start" || return 1
+    # This helper is used only for the child spawned by this invocation.
+    _oc_v2_server_matches "$pid" "$port" "$expected_start" || return 1
+    kill -TERM "$pid" 2>/dev/null || return 1
+    local -i attempt
+    for (( attempt = 0; attempt < 40; attempt++ )); do
+        _oc_v2_pid_alive "$pid" || return 0
+        sleep 0.1
+    done
+    ! _oc_v2_pid_alive "$pid"
+}
+
+_oc_v2_launch() (
     local config_file="$1" profile="$2"
     local -i want_restart="${3:-0}"
     local -i want_stop="${4:-0}"
     shift 4
     local -a args=("$@")
 
+    _oc_valid_profile "$profile" || { print -u2 "Invalid profile name '${profile}'"; return 1; }
+    local arg
+    for arg in "${args[@]}"; do
+        case "$arg" in
+            --server|--server=*)
+                print -u2 "oc controls the OpenCode --server URL for profile servers; remove the forwarded --server option."
+                return 1
+                ;;
+        esac
+    done
+
     local state_dir
     state_dir=$(_oc_v2_state_dir "$profile")
+    local lock_file="${state_dir}/wrapper.lock" lock_fd password_file="${state_dir}/password"
+    local pid_file="${state_dir}/pid" port_file="${state_dir}/port" start_file="${state_dir}/start"
+    local serve_log="${state_dir}/serve.log"
+    local config_fragment="profiles/${profile}/opencode.jsonc"
+    local pid port password candidate base checksum url start expected_start
+    local -i attempt candidate_index
 
-    # opencode is a mise tool and may spawn mise. Keep mise's own state at the
-    # user's real location so that only opencode's state is profile-scoped.
-    local real_state="${XDG_STATE_HOME:-$HOME/.local/state}"
-
-    # --stop: tear this profile's server down and exit.
-    if (( want_stop )); then
-        if [[ $(XDG_STATE_HOME="$state_dir" opencode service status 2>/dev/null) == http* ]]; then
-            XDG_STATE_HOME="$state_dir" opencode service stop 2>/dev/null
-            print "Stopped opencode service for profile '${profile}'"
-        else
-            print "No running opencode service for profile '${profile}'"
+    if [[ ! -d "$state_dir" ]]; then
+        if (( want_stop )); then
+            print "No running opencode server for profile '${profile}'"
+            return 0
         fi
+        ( umask 077; mkdir -p -- "$state_dir" ) || { print -u2 "Cannot create metadata directory ${state_dir}"; return 1; }
+    fi
+    [[ ! -L "$state_dir" ]] || { print -u2 "Refusing symlink metadata directory ${state_dir}"; return 1; }
+    chmod 700 "$state_dir" 2>/dev/null || { print -u2 "Cannot protect metadata directory ${state_dir}"; return 1; }
+    if (( want_stop )) && [[ ! -e "$pid_file" && ! -e "$port_file" && ! -e "$password_file" ]]; then
+        print "No running opencode server for profile '${profile}'"
         return 0
     fi
 
-    # --restart: replace this profile's server before (re)launching.
-    if (( want_restart )); then
-        XDG_STATE_HOME="$state_dir" opencode service stop 2>/dev/null
+    # The kernel releases this advisory lock if the wrapper exits unexpectedly,
+    # avoiding stale lock directories. The daemon command closes its lock FD.
+    if [[ -L "$lock_file" ]]; then
+        print -u2 "Refusing symlink wrapper lock for profile '${profile}'"
+        return 1
+    fi
+    if [[ ! -e "$lock_file" ]]; then
+        ( umask 077; : >| "$lock_file" ) || { print -u2 "Cannot create profile lock file."; return 1; }
+    fi
+    chmod 600 "$lock_file" 2>/dev/null || { print -u2 "Cannot protect profile lock file."; return 1; }
+    zmodload zsh/system 2>/dev/null || { print -u2 "This zsh installation lacks zsystem flock support."; return 1; }
+    if ! zsystem flock -t 5 -f lock_fd "$lock_file"; then
+        print -u2 "Another oc operation is managing profile '${profile}'. Retry shortly."
+        return 1
     fi
 
-    local service_url
-    service_url=$(XDG_STATE_HOME="$state_dir" opencode service status 2>/dev/null)
+    if [[ -L "$password_file" ]]; then
+        print -u2 "Refusing symlink password metadata for profile '${profile}'"
+        return 1
+    fi
+    if [[ -L "$start_file" ]]; then
+        print -u2 "Refusing symlink start-identity metadata for profile '${profile}'"
+        return 1
+    fi
+    [[ ! -f "$password_file" ]] || chmod 600 "$password_file" 2>/dev/null || {
+        print -u2 "Cannot protect profile password metadata for '${profile}'"
+        return 1
+    }
+    [[ ! -f "$start_file" ]] || chmod 600 "$start_file" 2>/dev/null || {
+        print -u2 "Cannot protect profile start-identity metadata for '${profile}'"
+        return 1
+    }
 
-    # Attach if a service for this profile is already running with the right
-    # config. Refuse (rather than kill) if the registered service is running a
-    # different config — the user must opt in with --restart.
-    if [[ "$service_url" == http* ]]; then
-        local server_config
-        server_config=$(XDG_STATE_HOME="$state_dir" opencode debug config 2>/dev/null)
-        if [[ "$server_config" == *"profiles/${profile}/opencode.jsonc"* ]]; then
-            XDG_STATE_HOME="$state_dir" MISE_STATE_DIR="$real_state/mise" opencode "${args[@]}"
+    local metadata_complete=0
+    if [[ -f "$pid_file" && -f "$port_file" && -f "$password_file" && -f "$start_file" && ! -L "$password_file" && ! -L "$start_file" ]]; then
+        pid=$(<"$pid_file")
+        port=$(<"$port_file")
+        password=$(<"$password_file")
+        start=$(<"$start_file")
+        if [[ "$pid" =~ '^[0-9]{1,10}$' && "$port" =~ '^[0-9]{5}$' &&
+              -n "$start" &&
+              "$password" =~ '^[0-9a-f]{64}$' ]]; then
+            pid=$(( 10#$pid ))
+            port=$(( 10#$port ))
+            if (( pid > 0 && port >= 52000 && port <= 61999 )); then
+                metadata_complete=1
+            fi
+        fi
+    fi
+    if (( ! metadata_complete )) && [[ -f "$pid_file" ]]; then
+        pid=$(<"$pid_file")
+        if [[ "$pid" =~ '^[0-9]{1,10}$' ]]; then
+            pid=$(( 10#$pid ))
+            if (( pid > 0 )) && _oc_v2_pid_alive "$pid"; then
+                print -u2 "Profile '${profile}' has a live PID but incomplete wrapper metadata. Refusing to start or signal another process."
+                return 1
+            fi
+        fi
+    fi
+
+    if (( metadata_complete )) && _oc_v2_server_matches "$pid" "$port" "$start"; then
+        if ! _oc_v2_api_matches "$pid" "$port" "$password" "$config_fragment" "$start" "$serve_log"; then
+            print -u2 "Profile '${profile}' has a server that could not be authenticated and config-verified. Refusing to attach or stop it."
+            return 1
+        fi
+        if (( want_stop || want_restart )); then
+            _oc_v2_stop_owned "$state_dir" "$pid" "$port" "$password" "$config_fragment" "$start" || return 1
+        else
+            zsystem flock -u "$lock_fd" 2>/dev/null
+            exec {lock_fd}>&-
+            url="http://127.0.0.1:${port}"
+            OPENCODE_CONFIG="$config_file" OPENCODE_PASSWORD="$password" opencode --server "$url" "${args[@]}"
             return $?
         fi
-        print -u2 "Profile '${profile}' has a running service with a different config."
-        print -u2 "Use 'oc -p ${profile} --restart' to replace it."
+    elif (( metadata_complete )) && _oc_v2_pid_alive "$pid"; then
+        print -u2 "Profile '${profile}' metadata points to a live process that cannot be proven to be its opencode server. Refusing to signal it."
         return 1
+    elif (( want_stop )); then
+        rm -f -- "$pid_file" "$start_file"
+        print "No running opencode server for profile '${profile}'"
+        return 0
+    else
+        # A dead PID is stale metadata; it is safe to discard without signaling.
+        rm -f -- "$pid_file" "$start_file"
     fi
 
-    # No service for this profile: start a fresh one without touching any other
-    # profile, then attach.
-    mkdir -p "$state_dir"
-    command nohup env XDG_STATE_HOME="$state_dir" MISE_STATE_DIR="$real_state/mise" \
-        OPENCODE_CONFIG="$config_file" \
-        opencode serve --service --port 0 >> "${state_dir}/serve.log" 2>&1 &!
+    if (( want_stop )); then
+        print "No running opencode server for profile '${profile}'"
+        return 0
+    fi
 
-    local -i attempt
-    for (( attempt = 0; attempt < 30; attempt++ )); do
-        service_url=$(XDG_STATE_HOME="$state_dir" opencode service status 2>/dev/null)
-        [[ "$service_url" == http* ]] && break
-        sleep 0.5
+    password=$(od -An -N32 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    if [[ ! "$password" =~ '^[0-9a-f]{64}$' ]]; then
+        print -u2 "Could not generate a valid profile server password."
+        return 1
+    fi
+    [[ ! -L "$serve_log" && ( ! -e "$serve_log" || -f "$serve_log" ) ]] || {
+        print -u2 "Refusing server log that is a symlink or non-regular file: ${serve_log}"
+        return 1
+    }
+    ( umask 077; : >> "$serve_log" ) || { print -u2 "Cannot create server log in ${state_dir}"; return 1; }
+    chmod 600 "$serve_log" 2>/dev/null || return 1
+    _oc_v2_atomic_write "$password_file" "$password" || { print -u2 "Cannot securely write profile password metadata."; return 1; }
+
+    if [[ -f "$port_file" ]]; then
+        candidate=$(<"$port_file")
+        if [[ "$candidate" =~ '^[0-9]{5}$' ]]; then
+            candidate=$(( 10#$candidate ))
+        fi
+        if [[ "$candidate" == <-> && "$candidate" -ge 52000 && "$candidate" -le 61999 ]]; then
+            base="$candidate"
+        else
+            base=""
+        fi
+    else
+        base=""
+    fi
+    if [[ -z "$base" ]]; then
+        checksum=$(printf '%s' "$profile" | cksum)
+        checksum=${checksum%% *}
+        base=$(( 52000 + checksum % 10000 ))
+    fi
+
+    for (( candidate_index = 0; candidate_index < 32; candidate_index++ )); do
+        port=$(( 52000 + (base - 52000 + candidate_index) % 10000 ))
+        _oc_v2_atomic_write "$port_file" "$port" || { print -u2 "Cannot write profile port metadata."; return 1; }
+        # Replace only dead/missing PID metadata. Never signal an unverified PID.
+        rm -f -- "$pid_file" "$start_file"
+        [[ ! -L "$serve_log" && ( ! -e "$serve_log" || -f "$serve_log" ) ]] || {
+            print -u2 "Refusing server log that is a symlink or non-regular file: ${serve_log}"
+            return 1
+        }
+        : >| "$serve_log" || { print -u2 "Cannot reset server log in ${state_dir}"; return 1; }
+        OPENCODE_CONFIG="$config_file" OPENCODE_SERVER_PASSWORD="$password" \
+            nohup opencode serve --hostname 127.0.0.1 --port "$port" {lock_fd}>&- >> "$serve_log" 2>&1 &!
+        pid=$!
+        expected_start=$(ps -p "$pid" -o lstart= 2>/dev/null)
+        if [[ -z "$expected_start" ]]; then
+            if _oc_v2_pid_alive "$pid"; then
+                _oc_v2_atomic_write "$pid_file" "$pid" 2>/dev/null
+                print -u2 "Could not record start identity for live server PID ${pid}; leaving it untouched."
+                return 1
+            fi
+            rm -f -- "$pid_file" "$start_file"
+            continue
+        fi
+        if ! _oc_v2_atomic_write "$pid_file" "$pid" || ! _oc_v2_atomic_write "$start_file" "$expected_start"; then
+            _oc_v2_stop_spawned "$pid" "$port" "$expected_start" 2>/dev/null
+            print -u2 "Cannot write profile process identity metadata."
+            return 1
+        fi
+
+        for (( attempt = 0; attempt < 40; attempt++ )); do
+            if ! _oc_v2_pid_alive "$pid"; then
+                break
+            fi
+            if _oc_v2_server_matches "$pid" "$port" "$expected_start" && _oc_v2_log_bound "$port" "$serve_log"; then
+                if _oc_v2_api_matches "$pid" "$port" "$password" "$config_fragment" "$expected_start" "$serve_log"; then
+                    url="http://127.0.0.1:${port}"
+                    zsystem flock -u "$lock_fd" 2>/dev/null
+                    exec {lock_fd}>&-
+                    OPENCODE_CONFIG="$config_file" OPENCODE_PASSWORD="$password" opencode --server "$url" "${args[@]}"
+                    return $?
+                fi
+            fi
+            sleep 0.25
+        done
+
+        if ! _oc_v2_pid_alive "$pid"; then
+            rm -f -- "$pid_file" "$start_file"
+            # A process that exits during startup is safe to retry on another port.
+            continue
+        fi
+        if ! _oc_v2_server_matches "$pid" "$port" "$expected_start"; then
+            print -u2 "Could not revalidate the spawned server PID ${pid}; leaving it untouched."
+            return 1
+        fi
+        if ! _oc_v2_log_bound "$port" "$serve_log"; then
+            if ! _oc_v2_stop_spawned "$pid" "$port" "$expected_start"; then
+                print -u2 "Timed out waiting for the verified spawned server PID ${pid} to exit; no other process was signaled."
+                return 1
+            fi
+            if _oc_v2_bind_failed "$serve_log"; then
+                rm -f -- "$pid_file" "$start_file"
+                # Retry only when this process's log proves the bind was rejected.
+                continue
+            fi
+            print -u2 "The spawned server did not prove a successful bind on port ${port}; it was terminated safely."
+            return 1
+        fi
+        # Only clean up the child launched above, and only while both its
+        # process identity and successful bind are still verifiable.
+        if ! _oc_v2_server_matches "$pid" "$port" "$expected_start" ||
+           ! _oc_v2_log_bound "$port" "$serve_log"; then
+            print -u2 "Could not revalidate the bound spawned server PID ${pid}; it remains running for safety."
+            return 1
+        fi
+        if ! _oc_v2_stop_spawned "$pid" "$port" "$expected_start"; then
+            print -u2 "Could not safely stop the bound spawned server PID ${pid}; it remains running for safety."
+            return 1
+        fi
+        rm -f -- "$pid_file" "$start_file"
+        print -u2 "Authenticated configuration verification failed for the spawned server on port ${port}; it was safely stopped."
+        return 1
     done
 
-    if [[ "$service_url" != http* ]]; then
-        print -u2 "Timed out waiting for the '${profile}' service to start."
-        print -u2 "Last lines of ${state_dir}/serve.log:"
-        tail -n 20 "${state_dir}/serve.log" 2>/dev/null | sed 's/^/  /'
-        return 1
-    fi
-
-    XDG_STATE_HOME="$state_dir" MISE_STATE_DIR="$real_state/mise" OPENCODE_CONFIG="$config_file" opencode "${args[@]}"
-}
+    print -u2 "No safe loopback port was available for profile '${profile}' after 32 attempts."
+    print -u2 "No process occupying a candidate port was stopped."
+    return 1
+)
 
 oc() {
     local profile="personal"
@@ -157,6 +428,10 @@ oc() {
             return 1
         fi
         local source_profile="${positionals[1]}" dest_profile="${positionals[2]}"
+        if ! _oc_valid_profile "$source_profile" || ! _oc_valid_profile "$dest_profile"; then
+            print -u2 "Invalid profile name. Use letters, digits, dot, underscore, or hyphen; the first character must be alphanumeric."
+            return 1
+        fi
         local source_dir="${profiles_dir}/${source_profile}"
         local dest_dir="${profiles_dir}/${dest_profile}"
         if [[ ! -d "$source_dir" ]]; then
@@ -179,6 +454,10 @@ oc() {
             return 1
         fi
         local delete_profile="${positionals[1]}"
+        if ! _oc_valid_profile "$delete_profile"; then
+            print -u2 "Invalid profile name. Use letters, digits, dot, underscore, or hyphen; the first character must be alphanumeric."
+            return 1
+        fi
         local delete_dir="${profiles_dir}/${delete_profile}"
         if [[ ! -d "$delete_dir" ]]; then
             print -u2 "Profile '${delete_profile}' not found"
@@ -189,7 +468,25 @@ oc() {
         return 0
     fi
 
+    if ! _oc_valid_profile "$profile"; then
+        print -u2 "Invalid profile name. Use letters, digits, dot, underscore, or hyphen; the first character must be alphanumeric."
+        return 1
+    fi
+
     local config_file="${profiles_dir}/${profile}/opencode.jsonc"
+
+    local major
+    major=$(_oc_opencode_major_version)
+    if (( ${major:-0} < 2 )) && (( do_restart || do_stop )); then
+        print -u2 "--stop and --restart are supported only with opencode v2 or newer."
+        return 1
+    fi
+
+    # Stopping a v2 server does not require the profile config to still exist.
+    if (( ${major:-0} >= 2 )) && (( do_stop )); then
+        _oc_v2_launch "$config_file" "$profile" "$do_restart" "$do_stop" "${positionals[@]}"
+        return $?
+    fi
 
     if [[ ! -f "$config_file" ]]; then
         print -u2 "Profile '${profile}' not found at ${config_file}"
@@ -201,9 +498,7 @@ oc() {
         return 1
     fi
 
-    # v2 detects its own background service; v1 just honors OPENCODE_CONFIG.
-    local major
-    major=$(_oc_opencode_major_version)
+    # v2 manages its own wrapper-launched loopback server; v1 honors OPENCODE_CONFIG.
     if (( ${major:-0} >= 2 )); then
         _oc_v2_launch "$config_file" "$profile" "$do_restart" "$do_stop" "${positionals[@]}"
     else

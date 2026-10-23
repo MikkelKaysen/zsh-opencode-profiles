@@ -82,36 +82,46 @@ oc -d work           # short form
 
 ### Background Servers (v2)
 
-With opencode v2, each profile runs its **own background server** on its own
-ephemeral port, isolated via a per-profile state directory
-(`~/.local/state/oc/<profile>/`). Different profiles can therefore run at the
-same time without one displacing another:
+With opencode v2, `oc` starts and manages an ordinary `opencode serve` process
+for each profile. Each server binds only to `127.0.0.1` on a deterministic
+profile-specific port in the range `52000`–`61999`; if that port is occupied,
+`oc` tries up to 31 following ports. It never kills a process to free a port.
+The wrapper attaches through OpenCode's native `--server` option, so different
+profiles can run concurrently without using OpenCode's global service
+registration:
+
+`oc` controls `--server` for the managed profile URL; forwarding another
+`--server` option is rejected.
 
 ```sh
 oc -p work          # start (or attach to) the work profile's server
 oc -p minds         # start (or attach to) the minds server too — both run
+oc -p work --restart # stop the verified work server, start a fresh one
+oc -p work --stop    # stop the verified work server and exit
 ```
 
-- Sessions and credentials stay shared (opencode's data directory is not
-  partitioned per profile).
-- Only opencode's own state is profile-scoped. `mise` (which opencode may
-  invoke) is pinned to your normal state location via `MISE_STATE_DIR`, so it
-  isn't duplicated into each profile's state dir.
-- `oc` never stops a server belonging to another profile. To replace the server
-  for the profile you are launching, use `--restart`; to stop it without
-  relaunching, use `--stop`:
+- Wrapper-only metadata and logs are stored under
+  `${XDG_STATE_HOME:-$HOME/.local/state}/oc/<profile>/` (directory mode `700`,
+  password file mode `600`). OpenCode and its children continue using the
+  normal shared XDG/data directories; sessions and credentials are not
+  partitioned by profile.
+- Each profile server gets a generated password. `oc` supplies it through the
+  server/client password environment variables, and authenticates its
+  ownership check before attach or stop. Passwords are not printed.
+- `--stop` and `--restart` act only when PID, user, server command, loopback
+  hostname, port, authenticated server PID, and profile config can all be
+  verified. If ownership/configuration cannot be proven, `oc` refuses to
+  attach or signal the process. A port conflict is skipped; if 32 candidates
+  cannot be started safely, the command fails without stopping the occupant.
+- Plain `opencode` and its global service are left alone. `oc` does not use
+  `opencode service stop` or OpenCode's service registry.
 
-```sh
-oc -p work --restart   # stop the work server, start a fresh one, attach
-oc -p work -s          # stop the work server and exit
-```
-
-If a profile's registered server is running a different config than expected,
-`oc` refuses to attach (it will not silently kill it) and suggests `--restart`.
-
-> **Note:** A background server that predates this behaviour (the single global
-> service on the default port 49374) is left untouched. Plain `opencode` still
-> talks to it. `oc`-launched servers use the per-profile layout above.
+> **Migration note:** Servers left running by the previous XDG-isolated
+> implementation are not discovered or stopped automatically. They may remain
+> active after upgrading. Review the process and its command line yourself and
+> stop only a server you can positively identify as an old profile-specific
+> `opencode serve --service` process; do not use the global `opencode service
+> stop` command as a migration shortcut.
 
 ### Profiles
 
