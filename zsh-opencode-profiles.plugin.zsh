@@ -264,7 +264,7 @@ _oc_v2_launch() (
         print -u2 "Refusing server log that is a symlink or non-regular file: ${serve_log}"
         return 1
     }
-    ( umask 077; : >> "$serve_log" ) || { print -u2 "Cannot create server log in ${state_dir}"; return 1; }
+    ( umask 077; command touch "$serve_log" ) || { print -u2 "Cannot create server log in ${state_dir}"; return 1; }
     chmod 600 "$serve_log" 2>/dev/null || return 1
     _oc_v2_atomic_write "$password_file" "$password" || { print -u2 "Cannot securely write profile password metadata."; return 1; }
 
