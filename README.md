@@ -119,6 +119,12 @@ oc -p work run "hello"     # routed to the work profile's server
   verified. If ownership/configuration cannot be proven, `oc` refuses to
   attach or signal the process. A port conflict is skipped; if 32 candidates
   cannot be started safely, the command fails without stopping the occupant.
+- `--stop` gives a verified server 30 seconds to shut down gracefully; OpenCode
+  reaps its MCP children one at a time, so a loaded server can take several
+  seconds. `oc` never force-kills a server. If it is still running after the
+  wait, the command fails and prints the manual recovery command
+  (`kill -9 <PID>`); once the process is gone, the next `oc` command removes
+  the leftover metadata automatically.
 - Plain `opencode` and its global service are left alone. `oc` does not use
   `opencode service stop` or OpenCode's service registry.
 

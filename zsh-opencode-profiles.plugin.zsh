@@ -93,14 +93,24 @@ _oc_v2_stop_owned() {
         print -u2 "Server identity changed before stop; leaving PID ${pid} untouched."
         return 1
     }
-    kill -TERM "$pid" 2>/dev/null || return 1
+    kill -TERM "$pid" 2>/dev/null || {
+        print -u2 "Could not signal the owned opencode server (PID ${pid}); it was not stopped."
+        return 1
+    }
+    # OpenCode's graceful shutdown reaps every MCP child (a few seconds each)
+    # and can drain attached clients, so allow 30s before declaring failure.
     local -i attempt
-    for (( attempt = 0; attempt < 40; attempt++ )); do
+    for (( attempt = 0; attempt < 300; attempt++ )); do
         _oc_v2_pid_alive "$pid" || break
+        if (( attempt == 50 )); then
+            print -u2 "Still waiting for graceful shutdown of the opencode server (PID ${pid})…"
+        fi
         sleep 0.1
     done
     if _oc_v2_pid_alive "$pid"; then
-        print -u2 "Timed out waiting for the owned opencode server (PID ${pid}) to exit; it was not force-killed."
+        print -u2 "Timed out waiting 30s for the owned opencode server (PID ${pid}) to exit; it was not force-killed."
+        print -u2 "If it is still running, stop it manually: kill -9 ${pid}"
+        print -u2 "Once the process is gone, the next oc command removes the leftover metadata automatically."
         return 1
     fi
     rm -f -- "${state_dir}/pid" "${state_dir}/start"
@@ -109,12 +119,11 @@ _oc_v2_stop_owned() {
 
 _oc_v2_stop_spawned() {
     local pid="$1" port="$2" expected_start="$3"
-    _oc_v2_server_matches "$pid" "$port" "$expected_start" || return 1
     # This helper is used only for the child spawned by this invocation.
     _oc_v2_server_matches "$pid" "$port" "$expected_start" || return 1
     kill -TERM "$pid" 2>/dev/null || return 1
     local -i attempt
-    for (( attempt = 0; attempt < 40; attempt++ )); do
+    for (( attempt = 0; attempt < 300; attempt++ )); do
         _oc_v2_pid_alive "$pid" || return 0
         sleep 0.1
     done
@@ -259,7 +268,8 @@ _oc_v2_launch() (
 
     if (( metadata_complete )) && _oc_v2_server_matches "$pid" "$port" "$start"; then
         if ! _oc_v2_api_matches "$pid" "$port" "$password" "$config_fragment" "$start" "$serve_log"; then
-            print -u2 "Profile '${profile}' has a server that could not be authenticated and config-verified. Refusing to attach or stop it."
+            print -u2 "Profile '${profile}' has a live process (PID ${pid}) recorded as its server, but it could not be authenticated and config-verified. Refusing to attach, stop, or signal it."
+            print -u2 "If this is a server lingering from a failed stop, wait for it to exit or stop it manually; once the process is gone, the next oc command removes the leftover metadata automatically."
             return 1
         fi
         if (( want_stop || want_restart )); then
@@ -378,6 +388,7 @@ _oc_v2_launch() (
         if ! _oc_v2_log_bound "$port" "$serve_log"; then
             if ! _oc_v2_stop_spawned "$pid" "$port" "$expected_start"; then
                 print -u2 "Timed out waiting for the verified spawned server PID ${pid} to exit; no other process was signaled."
+                print -u2 "If it is still running, stop it manually: kill -9 ${pid}"
                 return 1
             fi
             if _oc_v2_bind_failed "$serve_log"; then
@@ -397,6 +408,7 @@ _oc_v2_launch() (
         fi
         if ! _oc_v2_stop_spawned "$pid" "$port" "$expected_start"; then
             print -u2 "Could not safely stop the bound spawned server PID ${pid}; it remains running for safety."
+            print -u2 "If it is still running, stop it manually: kill -9 ${pid}"
             return 1
         fi
         rm -f -- "$pid_file" "$start_file"
