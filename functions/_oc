@@ -13,6 +13,8 @@ _arguments -C \
     '(-d --delete)'{-d,--delete}'[Delete a profile]' \
     '(-r --restart)'{-r,--restart}'[Restart the background server for this profile]' \
     '(-s --stop)'{-s,--stop}'[Stop the background server for this profile]' \
+    '--adopt[Re-verify and adopt the recorded live server for this profile]' \
+    '--reset[Discard wrapper metadata for this profile without stopping anything]' \
     '*:: :->args'
 
 if [[ $state == args ]]; then

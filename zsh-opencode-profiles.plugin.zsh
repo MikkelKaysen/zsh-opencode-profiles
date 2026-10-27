@@ -44,14 +44,17 @@ _oc_v2_pid_alive() {
 }
 
 _oc_v2_server_matches() {
-    local pid="$1" port="$2" expected_start="$3" uid="$(id -u)" ps_uid ps_args actual_start
-    [[ -n "$expected_start" ]] || return 1
+    local pid="$1" port="$2" expected_start="$3" skip_start="${4:-0}" uid="$(id -u)" ps_uid ps_args actual_start
+    [[ "$skip_start" == 1 ]] || [[ -n "$expected_start" ]] || return 1
     _oc_v2_pid_alive "$pid" || return 1
     ps_uid=$(ps -p "$pid" -o uid= 2>/dev/null) || return 1
     ps_args=$(ps -p "$pid" -o args= 2>/dev/null) || return 1
-    actual_start=$(ps -p "$pid" -o lstart= 2>/dev/null) || return 1
     ps_uid=${ps_uid//[[:space:]]/}
-    [[ "$ps_uid" == "$uid" && "$actual_start" == "$expected_start" &&
+    if [[ "$skip_start" != 1 ]]; then
+        actual_start=$(ps -p "$pid" -o lstart= 2>/dev/null) || return 1
+        [[ "$actual_start" == "$expected_start" ]] || return 1
+    fi
+    [[ "$ps_uid" == "$uid" &&
        "$ps_args" =~ '(^|[[:space:]/])opencode(\.exe)?[[:space:]]+serve([[:space:]]|$)' &&
        "$ps_args" == *"--hostname 127.0.0.1"* &&
        "$ps_args" =~ "(^|[[:space:]])--port[[:space:]]+${port}([[:space:]]|$)" ]]
@@ -68,9 +71,9 @@ _oc_v2_bind_failed() {
 }
 
 _oc_v2_api_matches() {
-    local pid="$1" port="$2" password="$3" config_fragment="$4" expected_start="$5" serve_log="$6"
+    local pid="$1" port="$2" password="$3" config_fragment="$4" expected_start="$5" serve_log="$6" skip_start="${7:-0}"
     local url="http://127.0.0.1:${port}" info info_pid server_config
-    _oc_v2_server_matches "$pid" "$port" "$expected_start" || return 1
+    _oc_v2_server_matches "$pid" "$port" "$expected_start" "$skip_start" || return 1
     _oc_v2_log_bound "$port" "$serve_log" || return 1
     info=$(OPENCODE_PASSWORD="$password" opencode api --server "$url" get /api/info 2>/dev/null) || return 1
     info_pid=$(print -r -- "$info" | tr '\n' ' ' | sed -n 's/^[[:space:]]*{[^{}]*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:],}].*/\1/p')
@@ -129,6 +132,185 @@ _oc_v2_stop_spawned() {
     done
     ! _oc_v2_pid_alive "$pid"
 }
+
+# Re-verify a live recorded server, skipping only the start-time identity,
+# and re-record its current identity. Used when a clock adjustment or PID
+# reuse invalidated the recorded start while the server itself is intact.
+_oc_v2_adopt() (
+    local profile="$1"
+    _oc_valid_profile "$profile" || { print -u2 "Invalid profile name '${profile}'"; return 1; }
+    local state_dir
+    state_dir=$(_oc_v2_state_dir "$profile")
+    local lock_file="${state_dir}/wrapper.lock" lock_fd
+    local pid_file="${state_dir}/pid" port_file="${state_dir}/port" start_file="${state_dir}/start"
+    local password_file="${state_dir}/password" serve_log="${state_dir}/serve.log"
+    local config_fragment="profiles/${profile}/opencode.jsonc"
+    local pid="" port="" password="" start="" current_start
+    if [[ ! -d "$state_dir" ]]; then
+        print "No running opencode server for profile '${profile}'"
+        return 0
+    fi
+    [[ ! -L "$state_dir" ]] || { print -u2 "Refusing symlink metadata directory ${state_dir}"; return 1; }
+    command chmod 700 "$state_dir" 2>/dev/null || { print -u2 "Cannot protect metadata directory ${state_dir}"; return 1; }
+    if [[ ! -f "$pid_file" || ! -f "$port_file" || ! -f "$password_file" ]]; then
+        print -u2 "Profile '${profile}' has missing PID, port, or password metadata; --adopt cannot repair it."
+        print -u2 "Discard the leftover metadata instead: oc -p ${profile} --reset"
+        return 1
+    fi
+    pid=$(<"$pid_file")
+    port=$(<"$port_file")
+    password=$(<"$password_file")
+    if [[ -f "$start_file" ]]; then
+        start=$(<"$start_file")
+    fi
+    if [[ ! "$pid" =~ '^[0-9]{1,10}$' || ! "$port" =~ '^[0-9]{5}$' || ! "$password" =~ '^[0-9a-f]{64}$' ]]; then
+        print -u2 "Profile '${profile}' has unreadable wrapper metadata; --adopt cannot repair it."
+        print -u2 "Discard the leftover metadata instead: oc -p ${profile} --reset"
+        return 1
+    fi
+    pid=$(( 10#$pid ))
+    port=$(( 10#$port ))
+    if (( pid <= 0 || port < 52000 || port > 61999 )); then
+        print -u2 "Profile '${profile}' has invalid wrapper metadata; --adopt cannot repair it."
+        print -u2 "Discard the leftover metadata instead: oc -p ${profile} --reset"
+        return 1
+    fi
+    if [[ -L "$lock_file" ]]; then
+        print -u2 "Refusing symlink wrapper lock for profile '${profile}'"
+        return 1
+    fi
+    if [[ ! -e "$lock_file" ]]; then
+        ( umask 077; : >| "$lock_file" ) || { print -u2 "Cannot create profile lock file."; return 1; }
+    fi
+    command chmod 600 "$lock_file" 2>/dev/null || { print -u2 "Cannot protect profile lock file."; return 1; }
+    zmodload zsh/system 2>/dev/null || { print -u2 "This zsh installation lacks zsystem flock support."; return 1; }
+    if ! zsystem flock -t 5 -f lock_fd "$lock_file"; then
+        print -u2 "Another oc operation is managing profile '${profile}'. Retry shortly."
+        return 1
+    fi
+    if ! _oc_v2_pid_alive "$pid"; then
+        print -u2 "Recorded PID ${pid} for profile '${profile}' is not running."
+        print "The next oc command removes the leftover metadata and starts a fresh server."
+        return 0
+    fi
+    if [[ -n "$start" ]] &&
+       _oc_v2_server_matches "$pid" "$port" "$start" &&
+       _oc_v2_log_bound "$port" "$serve_log" &&
+       _oc_v2_api_matches "$pid" "$port" "$password" "$config_fragment" "$start" "$serve_log"; then
+        print "Profile '${profile}' server (PID ${pid}) is already verified; nothing to adopt."
+        return 0
+    fi
+    if ! _oc_v2_server_matches "$pid" "$port" "" 1 ||
+       ! _oc_v2_log_bound "$port" "$serve_log" ||
+       ! _oc_v2_api_matches "$pid" "$port" "$password" "$config_fragment" "" "$serve_log" 1; then
+        print -u2 "Live process (PID ${pid}) recorded for profile '${profile}' could not be proven to be its opencode server without the start-time identity."
+        print -u2 "If it is an opencode server you want gone, stop it manually: kill ${pid}"
+        print -u2 "Or discard the wrapper metadata: oc -p ${profile} --reset"
+        return 1
+    fi
+    current_start=$(ps -p "$pid" -o lstart= 2>/dev/null)
+    if [[ -z "$current_start" ]]; then
+        print -u2 "Could not read the current start identity for PID ${pid}; the recorded metadata was left untouched."
+        return 1
+    fi
+    local prev_start="$start"
+    _oc_v2_atomic_write "$start_file" "$current_start" || {
+        print -u2 "Cannot write the refreshed start-identity metadata for profile '${profile}'; the server was left untouched."
+        return 1
+    }
+    if ! _oc_v2_server_matches "$pid" "$port" "$current_start" ||
+       ! _oc_v2_api_matches "$pid" "$port" "$password" "$config_fragment" "$current_start" "$serve_log"; then
+        if [[ -n "$prev_start" ]]; then
+            _oc_v2_atomic_write "$start_file" "$prev_start"
+        else
+            rm -f -- "$start_file"
+        fi
+        print -u2 "Server identity changed while adopting profile '${profile}'; the recorded metadata was left as found."
+        return 1
+    fi
+    print "Adopted live opencode server (PID ${pid}) for profile '${profile}'"
+    return 0
+)
+
+# Discard wrapper metadata for a profile without signaling any process.
+# A still-running recorded process is left untouched and must be stopped
+# manually if it is actually an opencode server.
+_oc_v2_reset() (
+    local profile="$1" want_force="${2:-0}"
+    _oc_valid_profile "$profile" || { print -u2 "Invalid profile name '${profile}'"; return 1; }
+    local state_dir
+    state_dir=$(_oc_v2_state_dir "$profile")
+    local lock_file="${state_dir}/wrapper.lock" lock_fd
+    local pid_file="${state_dir}/pid" port_file="${state_dir}/port" start_file="${state_dir}/start"
+    local password_file="${state_dir}/password" serve_log="${state_dir}/serve.log"
+    local config_fragment="profiles/${profile}/opencode.jsonc"
+    local pid="" port="" password="" start="" reported_pid="" vport
+    if [[ ! -d "$state_dir" ]]; then
+        print "No wrapper metadata for profile '${profile}'; nothing to reset."
+        return 0
+    fi
+    [[ ! -L "$state_dir" ]] || { print -u2 "Refusing symlink metadata directory ${state_dir}"; return 1; }
+    command chmod 700 "$state_dir" 2>/dev/null || { print -u2 "Cannot protect metadata directory ${state_dir}"; return 1; }
+    if [[ -f "$pid_file" ]]; then
+        pid=$(<"$pid_file")
+    fi
+    if [[ -f "$port_file" ]]; then
+        port=$(<"$port_file")
+    fi
+    if [[ -f "$password_file" ]]; then
+        password=$(<"$password_file")
+    fi
+    if [[ -f "$start_file" ]]; then
+        start=$(<"$start_file")
+    fi
+    if [[ -z "$pid" && -z "$port" && -z "$password" && -z "$start" ]]; then
+        print "No wrapper metadata for profile '${profile}'; nothing to reset."
+        return 0
+    fi
+    if [[ -L "$lock_file" ]]; then
+        print -u2 "Refusing symlink wrapper lock for profile '${profile}'"
+        return 1
+    fi
+    if [[ ! -e "$lock_file" ]]; then
+        ( umask 077; : >| "$lock_file" ) || { print -u2 "Cannot create profile lock file."; return 1; }
+    fi
+    command chmod 600 "$lock_file" 2>/dev/null || { print -u2 "Cannot protect profile lock file."; return 1; }
+    zmodload zsh/system 2>/dev/null || { print -u2 "This zsh installation lacks zsystem flock support."; return 1; }
+    if ! zsystem flock -t 5 -f lock_fd "$lock_file"; then
+        print -u2 "Another oc operation is managing profile '${profile}'. Retry shortly."
+        return 1
+    fi
+    if [[ "$pid" =~ '^[0-9]{1,10}$' ]]; then
+        reported_pid=$(( 10#$pid ))
+        if _oc_v2_pid_alive "$reported_pid"; then
+            if [[ "$port" =~ '^[0-9]{5}$' && -n "$start" && "$password" =~ '^[0-9a-f]{64}$' ]]; then
+                vport=$(( 10#$port ))
+                if (( vport >= 52000 && vport <= 61999 )) &&
+                   _oc_v2_server_matches "$reported_pid" "$vport" "$start" &&
+                   _oc_v2_log_bound "$vport" "$serve_log" &&
+                   _oc_v2_api_matches "$reported_pid" "$vport" "$password" "$config_fragment" "$start" "$serve_log"; then
+                    if (( want_force == 1 )); then
+                        print -u2 "WARNING: the recorded server (PID ${reported_pid}) is verified and healthy, but its metadata will be discarded. It keeps running; stop it manually: kill ${reported_pid}"
+                    else
+                        print -u2 "The recorded server for profile '${profile}' (PID ${reported_pid}) is verified and healthy."
+                        print -u2 "Stop it cleanly instead: oc -p ${profile} --stop"
+                        print -u2 "Or discard its metadata anyway: oc -p ${profile} --reset --force"
+                        return 1
+                    fi
+                fi
+            fi
+        else
+            reported_pid=""
+        fi
+    fi
+    rm -f -- "$pid_file" "$port_file" "$start_file" "$password_file"
+    print "Discarded wrapper metadata for profile '${profile}'."
+    if [[ -n "$reported_pid" ]]; then
+        print -u2 "The recorded process (PID ${reported_pid}) was left untouched. If it is an opencode server, stop it manually: kill ${reported_pid}"
+    fi
+    print "The next oc command starts a fresh server for profile '${profile}'."
+    return 0
+)
 
 _oc_v2_client() {
     local config_file="$1" password="$2" url="$3"
@@ -261,6 +443,8 @@ _oc_v2_launch() (
             pid=$(( 10#$pid ))
             if (( pid > 0 )) && _oc_v2_pid_alive "$pid"; then
                 print -u2 "Profile '${profile}' has a live PID but incomplete wrapper metadata. Refusing to start or signal another process."
+                print -u2 "Re-verify and repair the recorded start identity: oc -p ${profile} --adopt"
+                print -u2 "Or discard the leftover metadata: oc -p ${profile} --reset"
                 return 1
             fi
         fi
@@ -270,6 +454,7 @@ _oc_v2_launch() (
         if ! _oc_v2_api_matches "$pid" "$port" "$password" "$config_fragment" "$start" "$serve_log"; then
             print -u2 "Profile '${profile}' has a live process (PID ${pid}) recorded as its server, but it could not be authenticated and config-verified. Refusing to attach, stop, or signal it."
             print -u2 "If this is a server lingering from a failed stop, wait for it to exit or stop it manually; once the process is gone, the next oc command removes the leftover metadata automatically."
+            print -u2 "Or discard the wrapper metadata without stopping the process: oc -p ${profile} --reset"
             return 1
         fi
         if (( want_stop || want_restart )); then
@@ -285,6 +470,8 @@ _oc_v2_launch() (
         fi
     elif (( metadata_complete )) && _oc_v2_pid_alive "$pid"; then
         print -u2 "Profile '${profile}' metadata points to a live process that cannot be proven to be its opencode server. Refusing to signal it."
+        print -u2 "If this is your server (e.g. after a clock adjustment or PID reuse), re-verify and adopt it: oc -p ${profile} --adopt"
+        print -u2 "Otherwise, inspect PID ${pid} and stop it manually (kill ${pid}), or discard the wrapper metadata: oc -p ${profile} --reset"
         return 1
     elif (( want_stop )); then
         rm -f -- "$pid_file" "$start_file"
@@ -428,6 +615,8 @@ oc() {
     local do_delete=0
     local do_restart=0
     local do_stop=0
+    local do_adopt=0
+    local do_reset=0
     local -a positionals
 
     while [[ $# -gt 0 ]]; do
@@ -456,6 +645,14 @@ oc() {
                 do_stop=1
                 shift
                 ;;
+            --adopt)
+                do_adopt=1
+                shift
+                ;;
+            --reset)
+                do_reset=1
+                shift
+                ;;
             --)
                 shift
                 positionals+=("$@")
@@ -467,6 +664,23 @@ oc() {
                 ;;
         esac
     done 
+
+    if (( do_adopt + do_reset > 1 )); then
+        print -u2 -- "--adopt and --reset are mutually exclusive."
+        return 1
+    fi
+    if (( do_adopt + do_reset )) && (( do_copy + do_delete + do_stop + do_restart )); then
+        print -u2 -- "--adopt and --reset cannot be combined with --copy, --delete, --stop, or --restart."
+        return 1
+    fi
+    if (( do_adopt + do_reset )) && (( ${#positionals[@]} > 0 )); then
+        if (( do_adopt )); then
+            print -u2 "Usage: oc -p <profile> --adopt"
+        else
+            print -u2 "Usage: oc -p <profile> --reset [--force]"
+        fi
+        return 1
+    fi
 
     local profiles_dir="${HOME}/.config/opencode/profiles"
 
@@ -522,6 +736,15 @@ oc() {
     fi
 
     local config_file="${profiles_dir}/${profile}/opencode.jsonc"
+
+    if (( do_adopt )); then
+        _oc_v2_adopt "$profile"
+        return $?
+    fi
+    if (( do_reset )); then
+        _oc_v2_reset "$profile" "$do_force"
+        return $?
+    fi
 
     local major
     major=$(_oc_opencode_major_version)

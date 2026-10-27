@@ -135,6 +135,33 @@ oc -p work run "hello"     # routed to the work profile's server
 > `opencode serve --service` process; do not use the global `opencode service
 > stop` command as a migration shortcut.
 
+### Recovering a Stuck Profile
+
+`oc` refuses to attach to, stop, or signal a recorded server whose identity can
+no longer be fully re-verified. The recorded start-time identity can become
+stale without the server dying (an NTP clock adjustment or a suspend/resume
+shifts the process start time that `ps` reports), and the recorded PID can be
+reused by an unrelated process. When a command fails with such a refusal:
+
+- Re-verify and adopt the live server when it is yours. Everything is re-checked
+  (user, server command, hostname, port, authenticated server PID, profile
+  config, successful bind log) except the start-time identity, which is then
+  refreshed:
+
+  ```sh
+  oc -p work --adopt
+  ```
+
+- Discard the wrapper metadata when the live process is not provably the
+  profile's server, or the metadata is corrupted. `--reset` never signals a
+  process; if the recorded process is still running, stop it manually
+  (`kill <PID>`), and the next `oc` command starts a fresh server:
+
+  ```sh
+  oc -p work --reset          # refuses if the recorded server is healthy; use --stop
+  oc -p work --reset --force  # discard the metadata anyway
+  ```
+
 ### Profiles
 
 Profiles are discovered dynamically from `~/.config/opencode/profiles/*/opencode.jsonc`.
